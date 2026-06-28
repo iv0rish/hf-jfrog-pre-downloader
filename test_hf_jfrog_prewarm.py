@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import ssl
 from pathlib import Path
 from unittest import mock
 
@@ -103,6 +104,24 @@ class PrewarmTests(unittest.TestCase):
         )
 
         self.assertEqual(args.repo_id, "org/custom-model")
+
+    def test_ca_bundle_flag(self):
+        args = prewarm.parse_args(
+            [
+                "--jfrog-base-url",
+                "https://jfrog.example/artifactory/hf",
+                "--ca-bundle",
+                "/tmp/company-ca.pem",
+            ]
+        )
+
+        self.assertEqual(args.ca_bundle, "/tmp/company-ca.pem")
+
+    def test_insecure_tls_context_disables_verification(self):
+        context = prewarm.create_ssl_context(prewarm.TlsConfig(insecure_skip_verify=True))
+
+        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(context.check_hostname)
 
     def test_external_redirect_is_rejected_by_default(self):
         with self.assertRaisesRegex(RuntimeError, "redirected outside JFrog"):

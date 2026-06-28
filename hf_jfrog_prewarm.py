@@ -18,6 +18,7 @@ import fnmatch
 import json
 import os
 import shutil
+import ssl
 import sys
 import tempfile
 import time
@@ -55,6 +56,12 @@ class AuthConfig:
     bearer_token: str | None = None
     basic_user: str | None = None
     basic_password: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class TlsConfig:
+    ca_bundle: str | None = None
+    insecure_skip_verify: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,9 +152,17 @@ def auth_headers(auth: AuthConfig) -> dict[str, str]:
     return headers
 
 
-def request_json(url: str, auth: AuthConfig, timeout: float) -> dict:
+def create_ssl_context(tls: TlsConfig) -> ssl.SSLContext | None:
+    if tls.insecure_skip_verify:
+        return ssl._create_unverified_context()
+    if tls.ca_bundle:
+        return ssl.create_default_context(cafile=tls.ca_bundle)
+    return None
+
+
+def request_json(url: str, auth: AuthConfig, timeout: float, tls: TlsConfig) -> dict:
     request = urllib.request.Request(url, headers=auth_headers(auth))
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=create_ssl_context(tls)) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return json.loads(response.read().decode(charset))
 
@@ -162,8 +177,8 @@ def runtime_file_from_sibling(sibling: dict) -> ModelFile | None:
     return ModelFile(name=name, size=size if isinstance(size, int) else None)
 
 
-def discover_files_from_api(base_url: str, repo_id: str, auth: AuthConfig, timeout: float) -> list[ModelFile]:
-    payload = request_json(build_api_url(base_url, repo_id), auth, timeout)
+def discover_files_from_api(base_url: str, repo_id: str, auth: AuthConfig, timeout: float, tls: TlsConfig) -> list[ModelFile]:
+    payload = request_json(build_api_url(base_url, repo_id), auth, timeout, tls)
     siblings = payload.get("siblings")
     if not isinstance(siblings, list):
         raise RuntimeError("model API response did not include a siblings list")
@@ -278,11 +293,12 @@ def download_once(
     mode: str,
     temp_dir: Path,
     allow_external_redirect: bool,
+    tls: TlsConfig,
 ) -> DownloadResult:
     start = time.monotonic()
     url = build_resolve_url(base_url, repo_id, revision, file.name)
     request = urllib.request.Request(url, headers=auth_headers(auth))
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=create_ssl_context(tls)) as response:
         ensure_redirect_stayed_on_jfrog(url, response.geturl(), allow_external_redirect)
         if mode == "temp-file":
             bytes_read = consume_to_temp_file(response, file, temp_dir, chunk_size)
@@ -306,6 +322,7 @@ def download_with_retries(
     temp_dir: Path,
     retries: int,
     allow_external_redirect: bool,
+    tls: TlsConfig,
 ) -> DownloadResult:
     last_error: str | None = None
     for attempt in range(retries + 1):
@@ -321,6 +338,7 @@ def download_with_retries(
                 mode,
                 temp_dir,
                 allow_external_redirect,
+                tls,
             )
         except (OSError, urllib.error.URLError, urllib.error.HTTPError, RuntimeError) as exc:
             last_error = str(exc)
@@ -360,6 +378,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--jfrog-token", default=os.environ.get("JFROG_TOKEN"))
     parser.add_argument("--jfrog-user", default=os.environ.get("JFROG_USER"))
     parser.add_argument("--jfrog-password", default=os.environ.get("JFROG_PASSWORD"))
+    parser.add_argument(
+        "--ca-bundle",
+        default=os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE"),
+        help="Custom CA bundle path for JFrog TLS verification. Defaults to SSL_CERT_FILE, REQUESTS_CA_BUNDLE, or CURL_CA_BUNDLE.",
+    )
+    parser.add_argument(
+        "--insecure-skip-tls-verify",
+        action="store_true",
+        help="Disable TLS certificate verification. Use only for temporary diagnosis.",
+    )
     return parser.parse_args(argv)
 
 
@@ -380,12 +408,15 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--workers must be >= 1")
 
     auth = AuthConfig(args.jfrog_token, args.jfrog_user, args.jfrog_password)
+    tls = TlsConfig(args.ca_bundle, args.insecure_skip_tls_verify)
+    if tls.insecure_skip_verify:
+        print("WARNING: TLS certificate verification is disabled.", file=sys.stderr)
     try:
         if args.no_api_discovery:
             files = discover_shards_from_index(args.index_file)
         else:
             try:
-                files = discover_files_from_api(args.jfrog_base_url, args.repo_id, auth, args.timeout)
+                files = discover_files_from_api(args.jfrog_base_url, args.repo_id, auth, args.timeout, tls)
             except Exception as exc:
                 print(f"API discovery failed: {exc}", file=sys.stderr)
                 print(f"Falling back to local index file: {args.index_file}", file=sys.stderr)
@@ -439,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.temp_dir),
                 args.retries,
                 args.allow_external_redirect,
+                tls,
             ): file
             for file in pending
         }

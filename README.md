@@ -53,6 +53,26 @@ JFROG_TOKEN=... python3 hf_jfrog_prewarm.py \
   --jfrog-base-url https://public-jfrog.example.com/artifactory/huggingface-remote
 ```
 
+Use a corporate or private CA bundle when Python cannot verify the JFrog
+certificate:
+
+```bash
+python3 hf_jfrog_prewarm.py \
+  --jfrog-base-url https://public-jfrog.example.com/artifactory/huggingface-remote \
+  --ca-bundle /path/to/company-ca-bundle.pem \
+  --dry-run
+```
+
+The same path can be supplied with `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, or
+`CURL_CA_BUNDLE`. For temporary diagnosis only, TLS verification can be disabled:
+
+```bash
+python3 hf_jfrog_prewarm.py \
+  --jfrog-base-url https://public-jfrog.example.com/artifactory/huggingface-remote \
+  --insecure-skip-tls-verify \
+  --dry-run
+```
+
 Use temporary files instead of discard mode:
 
 ```bash
