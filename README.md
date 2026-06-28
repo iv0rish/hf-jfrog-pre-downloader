@@ -73,6 +73,27 @@ python3 hf_jfrog_prewarm.py \
   --dry-run
 ```
 
+If API discovery fails with an error like `expected JSON`, the JFrog remote is
+probably not proxying Hugging Face's `/api/models/...` endpoint as JSON. The
+default `--discovery auto` mode will then try to fetch
+`model.safetensors.index.json` through JFrog and parse the shard list in memory.
+This does not require direct laptop access to Hugging Face.
+
+You can force that mode explicitly:
+
+```bash
+python3 hf_jfrog_prewarm.py \
+  --jfrog-base-url https://public-jfrog.example.com/artifactory/huggingface-remote \
+  --discovery remote-index \
+  --insecure-skip-tls-verify \
+  --dry-run
+```
+
+Use `--metadata-base-url https://huggingface.co` only when the laptop can access
+Hugging Face directly. For private or gated metadata, set `HF_TOKEN` or pass
+`--hf-token`. JFrog credentials are still used for downloads through
+`--jfrog-base-url`.
+
 Use temporary files instead of discard mode:
 
 ```bash

@@ -16,6 +16,7 @@ import contextlib
 import dataclasses
 import fnmatch
 import json
+import json.decoder
 import os
 import shutil
 import ssl
@@ -33,6 +34,8 @@ DEFAULT_REPO_ID = "nvidia/GLM-5.2-NVFP4"
 DEFAULT_REVISION = "main"
 DEFAULT_STATE_FILE = ".hf-jfrog-prewarm-state.json"
 DEFAULT_CHUNK_SIZE = 16 * 1024 * 1024
+DEFAULT_MAX_INDEX_BYTES = 256 * 1024 * 1024
+DEFAULT_INDEX_FILENAME = "model.safetensors.index.json"
 RUNTIME_PATTERNS = (
     "model-*.safetensors",
     "model.safetensors.index.json",
@@ -164,7 +167,41 @@ def request_json(url: str, auth: AuthConfig, timeout: float, tls: TlsConfig) -> 
     request = urllib.request.Request(url, headers=auth_headers(auth))
     with urllib.request.urlopen(request, timeout=timeout, context=create_ssl_context(tls)) as response:
         charset = response.headers.get_content_charset() or "utf-8"
-        return json.loads(response.read().decode(charset))
+        body = response.read()
+        text = body.decode(charset, errors="replace")
+        try:
+            return json.loads(text)
+        except json.decoder.JSONDecodeError as exc:
+            status = getattr(response, "status", "unknown")
+            content_type = response.headers.get("content-type", "unknown")
+            snippet = text[:500].replace("\n", "\\n") or "<empty>"
+            raise RuntimeError(
+                f"expected JSON from {url}, got status {status}, "
+                f"content-type {content_type}, body starts with {snippet!r}"
+            ) from exc
+
+
+def request_bytes(
+    url: str,
+    auth: AuthConfig,
+    timeout: float,
+    tls: TlsConfig,
+    max_bytes: int,
+    allow_external_redirect: bool,
+) -> bytes:
+    request = urllib.request.Request(url, headers=auth_headers(auth))
+    with urllib.request.urlopen(request, timeout=timeout, context=create_ssl_context(tls)) as response:
+        ensure_redirect_stayed_on_jfrog(url, response.geturl(), allow_external_redirect)
+        chunks = []
+        total = 0
+        while True:
+            chunk = response.read(min(DEFAULT_CHUNK_SIZE, max_bytes + 1 - total))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise RuntimeError(f"response from {url} exceeded max index size {human_size(max_bytes)}")
 
 
 def runtime_file_from_sibling(sibling: dict) -> ModelFile | None:
@@ -188,17 +225,54 @@ def discover_files_from_api(base_url: str, repo_id: str, auth: AuthConfig, timeo
     return sorted(files, key=lambda item: item.name)
 
 
+def files_from_index_payload(payload: dict, index_name: str, index_size: int | None = None) -> list[ModelFile]:
+    weight_map = payload.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise RuntimeError("index payload does not contain a valid weight_map")
+    shard_names = sorted({value for value in weight_map.values() if isinstance(value, str)})
+    if not shard_names:
+        raise RuntimeError("index payload did not include shard filenames")
+    files = [ModelFile(name=name) for name in shard_names]
+    files.append(ModelFile(name=index_name, size=index_size))
+    for name in (
+        "config.json",
+        "generation_config.json",
+        "hf_quant_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ):
+        files.append(ModelFile(name=name))
+    return sorted(files, key=lambda item: item.name)
+
+
+def discover_files_from_remote_index(
+    base_url: str,
+    repo_id: str,
+    revision: str,
+    index_name: str,
+    auth: AuthConfig,
+    timeout: float,
+    tls: TlsConfig,
+    max_index_bytes: int,
+    allow_external_redirect: bool,
+) -> list[ModelFile]:
+    url = build_resolve_url(base_url, repo_id, revision, index_name)
+    body = request_bytes(url, auth, timeout, tls, max_index_bytes, allow_external_redirect)
+    payload = json.loads(body.decode("utf-8"))
+    return files_from_index_payload(payload, index_name, len(body))
+
+
+def metadata_auth_for(base_url: str, metadata_base_url: str, jfrog_auth: AuthConfig, hf_token: str | None) -> AuthConfig:
+    if host_of(base_url) == host_of(metadata_base_url):
+        return jfrog_auth
+    return AuthConfig(bearer_token=hf_token)
+
+
 def discover_shards_from_index(path: Path) -> list[ModelFile]:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    weight_map = payload.get("weight_map")
-    if not isinstance(weight_map, dict):
-        raise RuntimeError(f"{path} does not contain a valid weight_map")
-    names = sorted({value for value in weight_map.values() if isinstance(value, str)})
-    files = [ModelFile(name=name) for name in names]
-    if path.name not in names:
-        files.append(ModelFile(name=path.name, size=path.stat().st_size))
-    return sorted(files, key=lambda item: item.name)
+    return files_from_index_payload(payload, path.name, path.stat().st_size)
 
 
 def load_state(path: Path | None) -> dict:
@@ -368,8 +442,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-state", action="store_true")
     parser.add_argument("--force", action="store_true", help="Do not skip files marked complete in the state file.")
     parser.add_argument("--dry-run", action="store_true", help="List target files without downloading response bodies.")
-    parser.add_argument("--index-file", type=Path, default=Path("model.safetensors.index.json"))
+    parser.add_argument("--index-file", type=Path, default=Path(DEFAULT_INDEX_FILENAME))
+    parser.add_argument(
+        "--index-filename",
+        default=DEFAULT_INDEX_FILENAME,
+        help=f"Remote Hugging Face index filename used by remote-index discovery. Defaults to {DEFAULT_INDEX_FILENAME}.",
+    )
     parser.add_argument("--no-api-discovery", action="store_true", help="Use the local index file instead of JFrog API metadata.")
+    parser.add_argument(
+        "--discovery",
+        choices=("auto", "api", "remote-index", "local-index"),
+        default="auto",
+        help="How to discover runtime files. auto tries API, then remote index via JFrog, then local index.",
+    )
+    parser.add_argument("--max-index-bytes", type=parse_size, default=DEFAULT_MAX_INDEX_BYTES)
+    parser.add_argument(
+        "--metadata-base-url",
+        default=os.environ.get("HF_METADATA_BASE_URL"),
+        help="Base URL for Hugging Face model metadata discovery. Defaults to --jfrog-base-url. Use https://huggingface.co if JFrog does not proxy /api/models.",
+    )
     parser.add_argument(
         "--allow-external-redirect",
         action="store_true",
@@ -378,6 +469,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--jfrog-token", default=os.environ.get("JFROG_TOKEN"))
     parser.add_argument("--jfrog-user", default=os.environ.get("JFROG_USER"))
     parser.add_argument("--jfrog-password", default=os.environ.get("JFROG_PASSWORD"))
+    parser.add_argument(
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN"),
+        help="Hugging Face token used only when --metadata-base-url points outside the JFrog host.",
+    )
     parser.add_argument(
         "--ca-bundle",
         default=os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE"),
@@ -402,25 +498,69 @@ def print_file_plan(files: list[ModelFile]) -> None:
         print(f"  {file.name} ({human_size(file.size)})")
 
 
+def discover_files(args: argparse.Namespace, auth: AuthConfig, metadata_auth: AuthConfig, tls: TlsConfig) -> list[ModelFile]:
+    metadata_base_url = args.metadata_base_url or args.jfrog_base_url
+    if args.no_api_discovery:
+        return discover_shards_from_index(args.index_file)
+    if args.discovery == "api":
+        return discover_files_from_api(metadata_base_url, args.repo_id, metadata_auth, args.timeout, tls)
+    if args.discovery == "remote-index":
+        return discover_files_from_remote_index(
+            args.jfrog_base_url,
+            args.repo_id,
+            args.revision,
+            args.index_filename,
+            auth,
+            args.timeout,
+            tls,
+            args.max_index_bytes,
+            args.allow_external_redirect,
+        )
+    if args.discovery == "local-index":
+        return discover_shards_from_index(args.index_file)
+
+    errors = []
+    try:
+        return discover_files_from_api(metadata_base_url, args.repo_id, metadata_auth, args.timeout, tls)
+    except Exception as exc:
+        errors.append(f"api: {exc}")
+        print(f"API discovery failed: {exc}", file=sys.stderr)
+    try:
+        return discover_files_from_remote_index(
+            args.jfrog_base_url,
+            args.repo_id,
+            args.revision,
+            args.index_filename,
+            auth,
+            args.timeout,
+            tls,
+            args.max_index_bytes,
+            args.allow_external_redirect,
+        )
+    except Exception as exc:
+        errors.append(f"remote-index: {exc}")
+        print(f"Remote index discovery failed: {exc}", file=sys.stderr)
+    try:
+        print(f"Falling back to local index file: {args.index_file}", file=sys.stderr)
+        return discover_shards_from_index(args.index_file)
+    except Exception as exc:
+        errors.append(f"local-index: {exc}")
+        raise RuntimeError("; ".join(errors)) from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     if args.workers < 1:
         raise SystemExit("--workers must be >= 1")
 
     auth = AuthConfig(args.jfrog_token, args.jfrog_user, args.jfrog_password)
+    metadata_base_url = args.metadata_base_url or args.jfrog_base_url
+    metadata_auth = metadata_auth_for(args.jfrog_base_url, metadata_base_url, auth, args.hf_token)
     tls = TlsConfig(args.ca_bundle, args.insecure_skip_tls_verify)
     if tls.insecure_skip_verify:
         print("WARNING: TLS certificate verification is disabled.", file=sys.stderr)
     try:
-        if args.no_api_discovery:
-            files = discover_shards_from_index(args.index_file)
-        else:
-            try:
-                files = discover_files_from_api(args.jfrog_base_url, args.repo_id, auth, args.timeout, tls)
-            except Exception as exc:
-                print(f"API discovery failed: {exc}", file=sys.stderr)
-                print(f"Falling back to local index file: {args.index_file}", file=sys.stderr)
-                files = discover_shards_from_index(args.index_file)
+        files = discover_files(args, auth, metadata_auth, tls)
     except Exception as exc:
         print(f"File discovery failed: {exc}", file=sys.stderr)
         return 2
