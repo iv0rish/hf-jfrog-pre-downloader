@@ -22,6 +22,7 @@ import shutil
 import ssl
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -74,6 +75,81 @@ class DownloadResult:
     elapsed_seconds: float
     skipped: bool = False
     error: str | None = None
+
+
+class ProgressTracker:
+    def __init__(self, files: list[ModelFile], pending: list[ModelFile], interval_seconds: float) -> None:
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._interval_seconds = interval_seconds
+        self._total_files = len(files)
+        self._pending_files = len(pending)
+        self._known_total_bytes = sum(file.size for file in pending if file.size is not None)
+        self._completed_files = 0
+        self._failed_files = 0
+        self._bytes_read = 0
+        self._active: dict[str, int] = {}
+        self._started_at = time.monotonic()
+
+    def start(self) -> None:
+        if self._interval_seconds <= 0:
+            return
+        self._thread = threading.Thread(target=self._run, name="progress-reporter", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._interval_seconds + 1)
+        self.report(final=True)
+
+    def file_started(self, file: ModelFile) -> None:
+        with self._lock:
+            self._active[file.name] = 0
+
+    def add_bytes(self, file: ModelFile, amount: int) -> None:
+        with self._lock:
+            self._bytes_read += amount
+            self._active[file.name] = self._active.get(file.name, 0) + amount
+
+    def file_completed(self, file: ModelFile) -> None:
+        with self._lock:
+            self._completed_files += 1
+            self._active.pop(file.name, None)
+
+    def file_failed(self, file: ModelFile) -> None:
+        with self._lock:
+            self._failed_files += 1
+            self._active.pop(file.name, None)
+
+    def file_inactive(self, file: ModelFile) -> None:
+        with self._lock:
+            self._active.pop(file.name, None)
+
+    def report(self, final: bool = False) -> None:
+        with self._lock:
+            elapsed = max(time.monotonic() - self._started_at, 0.001)
+            rate = int(self._bytes_read / elapsed)
+            active = sorted(self._active.items())[:3]
+            known_total = self._known_total_bytes
+            if known_total:
+                percent = min(self._bytes_read / known_total * 100, 999.9)
+                total_text = f"{human_size(self._bytes_read)} / {human_size(known_total)} ({percent:.1f}%)"
+            else:
+                total_text = f"{human_size(self._bytes_read)} / unknown"
+            active_text = ", ".join(f"{name}: {human_size(size)}" for name, size in active) or "none"
+            prefix = "FINAL" if final else "PROGRESS"
+            message = (
+                f"{prefix} files {self._completed_files}/{self._pending_files} complete, "
+                f"{self._failed_files} failed, bytes {total_text}, rate {human_size(rate)}/s, "
+                f"active: {active_text}"
+            )
+        print(message, flush=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            self.report()
 
 
 def parse_size(value: str) -> int:
@@ -328,32 +404,31 @@ def ensure_temp_capacity(temp_dir: Path, files: Iterable[ModelFile], workers: in
         )
 
 
-def consume_to_discard(response, chunk_size: int) -> int:
+def consume_response(response, file: ModelFile, chunk_size: int, mode: str, temp_dir: Path, progress: ProgressTracker | None) -> int:
     bytes_read = 0
-    while True:
-        chunk = response.read(chunk_size)
-        if not chunk:
-            return bytes_read
-        bytes_read += len(chunk)
-
-
-def consume_to_temp_file(response, file: ModelFile, temp_dir: Path, chunk_size: int) -> int:
-    bytes_read = 0
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    safe_prefix = file.name.replace("/", "_")
-    fd, temp_name = tempfile.mkstemp(prefix=f"{safe_prefix}.", suffix=".tmp", dir=temp_dir)
+    temp_handle = None
+    temp_name = None
     try:
-        with os.fdopen(fd, "wb") as handle:
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                bytes_read += len(chunk)
-        return bytes_read
+        if mode == "temp-file":
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            safe_prefix = file.name.replace("/", "_")
+            fd, temp_name = tempfile.mkstemp(prefix=f"{safe_prefix}.", suffix=".tmp", dir=temp_dir)
+            temp_handle = os.fdopen(fd, "wb")
+        while True:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                return bytes_read
+            if temp_handle is not None:
+                temp_handle.write(chunk)
+            bytes_read += len(chunk)
+            if progress is not None:
+                progress.add_bytes(file, len(chunk))
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temp_name)
+        if temp_handle is not None:
+            temp_handle.close()
+        if temp_name is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp_name)
 
 
 def download_once(
@@ -368,16 +443,16 @@ def download_once(
     temp_dir: Path,
     allow_external_redirect: bool,
     tls: TlsConfig,
+    progress: ProgressTracker | None,
 ) -> DownloadResult:
     start = time.monotonic()
     url = build_resolve_url(base_url, repo_id, revision, file.name)
     request = urllib.request.Request(url, headers=auth_headers(auth))
+    if progress is not None:
+        progress.file_started(file)
     with urllib.request.urlopen(request, timeout=timeout, context=create_ssl_context(tls)) as response:
         ensure_redirect_stayed_on_jfrog(url, response.geturl(), allow_external_redirect)
-        if mode == "temp-file":
-            bytes_read = consume_to_temp_file(response, file, temp_dir, chunk_size)
-        else:
-            bytes_read = consume_to_discard(response, chunk_size)
+        bytes_read = consume_response(response, file, chunk_size, mode, temp_dir, progress)
     elapsed = time.monotonic() - start
     if file.size is not None and bytes_read != file.size:
         raise RuntimeError(f"received {bytes_read} bytes, expected {file.size}")
@@ -397,6 +472,7 @@ def download_with_retries(
     retries: int,
     allow_external_redirect: bool,
     tls: TlsConfig,
+    progress: ProgressTracker | None,
 ) -> DownloadResult:
     last_error: str | None = None
     for attempt in range(retries + 1):
@@ -413,8 +489,11 @@ def download_with_retries(
                 temp_dir,
                 allow_external_redirect,
                 tls,
+                progress,
             )
         except (OSError, urllib.error.URLError, urllib.error.HTTPError, RuntimeError) as exc:
+            if progress is not None:
+                progress.file_inactive(file)
             last_error = str(exc)
             if attempt >= retries:
                 break
@@ -436,6 +515,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--chunk-size", type=parse_size, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between progress updates while downloads are running. Set 0 to disable periodic updates.",
+    )
     parser.add_argument("--mode", choices=("discard", "temp-file"), default="discard")
     parser.add_argument("--temp-dir", default=tempfile.gettempdir())
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
@@ -595,6 +680,8 @@ def main(argv: list[str] | None = None) -> int:
     failures: list[DownloadResult] = []
     completed_bytes = 0
     started = time.monotonic()
+    progress = ProgressTracker(files, pending, args.progress_interval)
+    progress.start()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
@@ -611,16 +698,19 @@ def main(argv: list[str] | None = None) -> int:
                 args.retries,
                 args.allow_external_redirect,
                 tls,
+                progress,
             ): file
             for file in pending
         }
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             if result.error:
+                progress.file_failed(result.file)
                 failures.append(result)
                 print(f"FAIL {result.file.name}: {result.error}", file=sys.stderr)
                 continue
             completed_bytes += result.bytes_read
+            progress.file_completed(result.file)
             rate = result.bytes_read / result.elapsed_seconds if result.elapsed_seconds > 0 else 0
             mark_completed(state, result.file, result.bytes_read)
             save_state(state_path, state)
@@ -628,6 +718,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"OK {result.file.name}: {human_size(result.bytes_read)} "
                 f"in {result.elapsed_seconds:.1f}s ({human_size(int(rate))}/s)"
             )
+    progress.stop()
 
     elapsed = time.monotonic() - started
     print(f"Completed bytes this run: {human_size(completed_bytes)} in {elapsed:.1f}s")

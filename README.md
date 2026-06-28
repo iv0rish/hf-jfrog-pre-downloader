@@ -46,6 +46,10 @@ python3 hf_jfrog_prewarm.py \
 `--repo-id` can be any Hugging Face model repository id that the JFrog remote
 can access. You can also set it with `HF_REPO_ID`.
 
+While downloads are running, the script prints periodic progress updates every
+30 seconds by default. Adjust this with `--progress-interval 10`, or disable
+periodic updates with `--progress-interval 0`.
+
 Use JFrog authentication:
 
 ```bash
